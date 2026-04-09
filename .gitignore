@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# 데이터 파일
+data/
+models/
+
+# IDE
+.idea/
+.vscode/
+
+# 환경 변수
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# claude code
+.claude/
