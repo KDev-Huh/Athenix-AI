@@ -9,6 +9,18 @@ __pycache__/
 data/
 models/
 
+# YOLO 학습 결과 (runs/)
+runs/
+runs_pose/
+
+# 모델 가중치
+*.pt
+*.onnx
+*.engine
+
+# Jupyter
+.ipynb_checkpoints/
+
 # IDE
 .idea/
 .vscode/
