@@ -18,8 +18,10 @@ runs_pose/
 *.onnx
 *.engine
 
-# Jupyter
+# Jupyter & Notebooks
 .ipynb_checkpoints/
+*.ipynb
+notebooks/
 
 # IDE
 .idea/
