@@ -419,6 +419,48 @@ class TopViewAnalyzer:
         n_inliers = int(mask.sum()) if mask is not None else 0
         return H_mat, n_inliers
 
+    @staticmethod
+    def sb_to_pixel(
+        x_sb: float,
+        y_sb: float,
+        H_mat: np.ndarray,
+        image_shape: Optional[Dict[str, int]] = None,
+    ) -> Optional[Dict[str, float]]:
+        """
+        StatsBomb 좌표 → 원본 이미지 픽셀 좌표 역변환.
+
+        StatsBomb (0~120, 0~80) → FIFA (0~105m, 0~68m) → 역호모그래피 → 픽셀
+
+        Args:
+            x_sb:        StatsBomb x 좌표 (0~120)
+            y_sb:        StatsBomb y 좌표 (0~80)
+            H_mat:       _compute_homography()가 반환한 3×3 행렬 (픽셀→FIFA 방향)
+            image_shape: {"height": int, "width": int} 이미지 크기.
+                         전달 시 픽셀 좌표를 이미지 범위 내로 클램핑한다.
+
+        Returns:
+            {"x": float, "y": float} 픽셀 좌표, H_mat이 None이면 None
+        """
+        if H_mat is None:
+            return None
+        x_fifa = x_sb * 105.0 / 120.0
+        y_fifa = y_sb * 68.0  / 80.0
+        H_inv  = np.linalg.inv(H_mat)
+        pt     = cv2.perspectiveTransform(
+            np.array([[[x_fifa, y_fifa]]], dtype=np.float32), H_inv
+        )
+        px, py = float(pt[0][0][0]), float(pt[0][0][1])
+
+        print(f"[sb_to_pixel] sb=({x_sb}, {y_sb}) -> fifa=({x_fifa:.2f}, {y_fifa:.2f}) -> pixel=({px:.1f}, {py:.1f})")
+
+        if image_shape is not None:
+            w, h = float(image_shape["width"]), float(image_shape["height"])
+            px = max(0.0, min(px, w))
+            py = max(0.0, min(py, h))
+            print(f"[sb_to_pixel] clamped=({px:.1f}, {py:.1f})  image=({int(w)}x{int(h)})")
+
+        return {"x": round(px, 1), "y": round(py, 1)}
+
     def _transform_to_field(
         self,
         detections:  List[Dict],

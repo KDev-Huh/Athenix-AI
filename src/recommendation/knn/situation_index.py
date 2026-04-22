@@ -31,7 +31,7 @@ class SituationIndex:
 
     _META_COLS = [
         "event_id", "match_id", "type_name", "result_name",
-        "start_x", "start_y", "vaep_value",
+        "start_x", "start_y", "end_x", "end_y", "vaep_value",
     ]
 
     def __init__(self) -> None:

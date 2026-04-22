@@ -28,8 +28,10 @@ class SituationFinder:
 
     _RESULT_COLS = [
         "event_id", "match_id", "type_name", "result_name",
-        "start_x", "start_y", "vaep_value", "distance",
+        "start_x", "start_y", "end_x", "end_y", "vaep_value", "distance",
     ]
+
+    ALLOWED_TYPES = {"pass", "shot", "dribble", "cross"}
 
     def __init__(self, index: SituationIndex) -> None:
         """
@@ -66,7 +68,8 @@ class SituationFinder:
             max_distance 이내 결과가 없으면 빈 DataFrame 반환
         """
         q = self._vectorize_query(players, ball_pos, carrier_pos)
-        n_candidates = min(top_k * 5, len(self._idx.meta))
+        # type 필터링 후에도 top_k 확보를 위해 넉넉하게 후보 탐색
+        n_candidates = min(top_k * 20, len(self._idx.meta))
 
         dists, js = self._idx.kneighbors(q, n_candidates)
         dists, js = dists[0], js[0]
@@ -75,7 +78,10 @@ class SituationFinder:
         result["distance"] = dists
 
         filtered = (
-            result[result["distance"] <= max_distance]
+            result[
+                (result["distance"] <= max_distance) &
+                (result["type_name"].isin(self.ALLOWED_TYPES))
+            ]
             .sort_values("vaep_value", ascending=False)
             .head(top_k)
             .reset_index(drop=True)

@@ -41,6 +41,7 @@ SoccerSceneRecommender
 
 import json
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -49,6 +50,7 @@ import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.spatial import cKDTree
 
 from .detection import DetectionPredictor
 from .keypoints import KeypointsPredictor
@@ -93,12 +95,13 @@ class SoccerSceneRecommender:
         self._index_dir     = knn_index_dir
         self._csv_path      = Path(csv_path)
 
-        self._det      : Optional[DetectionPredictor] = None
-        self._kp       : Optional[KeypointsPredictor] = None
-        self._analyzer : Optional[TopViewAnalyzer]    = None
-        self._idx      : Optional[SituationIndex]     = None
-        self._finder   : Optional[SituationFinder]    = None
-        self._df       : Optional[pd.DataFrame]       = None
+        self._det        : Optional[DetectionPredictor] = None
+        self._kp         : Optional[KeypointsPredictor] = None
+        self._analyzer   : Optional[TopViewAnalyzer]    = None
+        self._idx        : Optional[SituationIndex]     = None
+        self._finder     : Optional[SituationFinder]    = None
+        self._df         : Optional[pd.DataFrame]       = None
+        self._zone_trees : Optional[dict]               = None  # (zone, role) → {tree, event_ids}
 
     # ── 공개 메서드 ────────────────────────────────────────────────────────
 
@@ -144,6 +147,9 @@ class SoccerSceneRecommender:
 
         self._df = pd.read_csv(self._csv_path)
         print(f"CSV                 loaded  ({len(self._df):,} rows)")
+
+        self._zone_trees = self._build_zone_index(self._df)
+        print(f"ZoneIndex           built   ({len(self._zone_trees)} zone-role trees)")
 
     def recommend(
         self,
@@ -252,11 +258,187 @@ class SoccerSceneRecommender:
             "topview_result": topview_result,
         }
 
+    def zone_recommend(
+        self,
+        image_path: str,
+        is_rtl: bool                = False,
+        top_k: int                  = 3,
+        radius_rel: float           = 3.0,
+        min_matches: int            = 3,
+        team_color_threshold: float = 40.0,
+        color_method: str           = "mean_l_norm",
+        outlier_std_factor: float   = 2.0,
+        ball_retry_conf: float      = 0.2,
+        save_topview: Optional[str] = None,
+        show_plot: bool             = True,
+    ) -> dict:
+        """
+        Zone + Ball-Relative 방식으로 유사 장면을 추천한다.
+
+        피치를 6구역으로 분할하고 공 기준 상대 좌표로 선수 패턴을 매칭하여
+        같은 구역 내 절대 좌표가 유사한 이벤트를 반환한다.
+
+        Args:
+            image_path:   분석할 이미지 경로
+            is_rtl:       True면 RTL→LTR 좌표 플립
+            top_k:        추천 결과 수 (기본 3)
+            radius_rel:   ball-relative 공간 탐색 반경 (기본 3.0 SB-units)
+            min_matches:  최소 매칭 선수 수 (기본 3)
+            ...           나머지는 recommend()와 동일
+
+        Returns:
+            recommend()와 동일한 구조.
+            results DataFrame 컬럼: event_id, match_id, type_name, result_name,
+                                    start_x, start_y, end_x, end_y, vaep_value, match_count
+        """
+        self._check_loaded()
+
+        topview_result = self._analyze_image(
+            image_path,
+            team_color_threshold=team_color_threshold,
+            color_method=color_method,
+            outlier_std_factor=outlier_std_factor,
+            ball_retry_conf=ball_retry_conf,
+        )
+        fp = topview_result["field_positions"]
+
+        if save_topview is not None:
+            self._analyzer.visualize(image_path, topview_result, save_path=save_topview)
+
+        players, ball_pos, carrier_pos, carrier_team = self._prepare_query(fp)
+
+        if is_rtl:
+            ball_pos, carrier_pos, players = self._flip_ltr(ball_pos, carrier_pos, players)
+
+        results = self._zone_search(players, ball_pos, top_k, radius_rel, min_matches)
+        self._print_zone_results(results, top_k)
+
+        query = {
+            "players":      players,
+            "ball_pos":     ball_pos,
+            "carrier_pos":  carrier_pos,
+            "carrier_team": carrier_team,
+        }
+
+        fig = self._visualize(query, results)
+        if show_plot:
+            plt.show()
+        else:
+            plt.close(fig)
+
+        return {
+            "results":        results,
+            "query":          query,
+            "topview_result": topview_result,
+        }
+
     # ── 내부 헬퍼 ─────────────────────────────────────────────────────────
 
     def _check_loaded(self) -> None:
         if self._finder is None:
             raise RuntimeError("load_models()를 먼저 호출해 주세요.")
+
+    # ── Zone + Ball-Relative 헬퍼 ──────────────────────────────────────────
+
+    _ALLOWED_TYPES = {"pass", "shot", "dribble", "cross"}
+
+    @staticmethod
+    def _get_zone(x: float, y: float) -> tuple:
+        """StatsBomb 좌표 → (col, row) 구역 번호. 3열×2행 = 6구역."""
+        col = 0 if x < 40 else (1 if x < 80 else 2)
+        row = 0 if y < 40 else 1
+        return (col, row)
+
+    @staticmethod
+    def _build_zone_index(df: pd.DataFrame) -> dict:
+        """
+        CSV DataFrame으로 (zone, role) 별 cKDTree를 빌드한다.
+
+        Returns:
+            {(zone, role): {"tree": cKDTree, "event_ids": np.ndarray}}
+        """
+        print("ZoneIndex           building...")
+        rows = []
+        for _, row in df.iterrows():
+            if pd.isna(row["freeze_frame"]) or pd.isna(row["start_x"]):
+                continue
+            bx, by = float(row["start_x"]), float(row["start_y"])
+            zone   = SoccerSceneRecommender._get_zone(bx, by)
+            eid    = row["event_id"]
+            for p in json.loads(row["freeze_frame"]):
+                rows.append({
+                    "event_id": eid,
+                    "rel_x":    p["x"] - bx,
+                    "rel_y":    p["y"] - by,
+                    "role":     int(p["role"]),
+                    "zone":     zone,
+                })
+
+        df_rel = pd.DataFrame(rows)
+        trees  = {}
+        for (zone, role), sub in df_rel.groupby(["zone", "role"]):
+            sub = sub.reset_index(drop=True)
+            trees[(zone, role)] = {
+                "tree":      cKDTree(sub[["rel_x", "rel_y"]].values),
+                "event_ids": sub["event_id"].values,
+            }
+        return trees
+
+    def _zone_search(
+        self,
+        players:     list,
+        ball_pos:    tuple,
+        top_k:       int,
+        radius_rel:  float,
+        min_matches: int,
+    ) -> pd.DataFrame:
+        """
+        Zone + Ball-Relative 방식으로 유사 이벤트를 검색하고 결과 DataFrame을 반환한다.
+        """
+        query_zone   = self._get_zone(ball_pos[0], ball_pos[1])
+        event_counter = Counter()
+
+        for p in players:
+            key = (query_zone, p["role"])
+            if key not in self._zone_trees:
+                continue
+            td   = self._zone_trees[key]
+            rel_x = p["x"] - ball_pos[0]
+            rel_y = p["y"] - ball_pos[1]
+            idxs  = td["tree"].query_ball_point([rel_x, rel_y], r=radius_rel)
+            for eid in td["event_ids"][idxs]:
+                event_counter[eid] += 1
+
+        filtered_eids = {eid for eid, cnt in event_counter.items() if cnt >= min_matches}
+
+        if not filtered_eids:
+            print(f"  [ZoneSearch] 후보 없음 (radius_rel={radius_rel}, min_matches={min_matches})")
+            return pd.DataFrame(columns=["event_id", "match_id", "type_name", "result_name",
+                                         "start_x", "start_y", "end_x", "end_y",
+                                         "vaep_value", "match_count"])
+
+        meta = self._idx.meta[self._idx.meta["event_id"].isin(filtered_eids)].copy()
+        meta["match_count"] = meta["event_id"].map(event_counter)
+
+        return (
+            meta[meta["type_name"].isin(self._ALLOWED_TYPES)]
+            .sort_values(["match_count", "vaep_value"], ascending=[False, False])
+            .head(top_k)
+            .reset_index(drop=True)
+        )
+
+    def _print_zone_results(self, results: pd.DataFrame, top_k: int) -> None:
+        if results.empty:
+            print("유사 장면을 찾지 못했습니다.")
+            return
+        print(f"\nTop-{top_k} 추천 장면  (match_count 내림차순 → VAEP 내림차순):")
+        print(f"  {'Rank':<5} {'Type':<16} {'Result':<12} {'Matches':>7} {'VAEP':>8}")
+        print("  " + "-" * 55)
+        for rank, (_, r) in enumerate(results.iterrows(), start=1):
+            print(
+                f"  {rank:<5} {r['type_name']:<16} {r['result_name']:<12} "
+                f"{int(r['match_count']):>7} {r['vaep_value']:>8.4f}"
+            )
 
     def _analyze_image(
         self,
@@ -440,8 +622,12 @@ class SoccerSceneRecommender:
             self._draw_pitch(ax)
             self._draw_players(ax, players,     ball_pos,  carrier_pos, solid=False)  # 쿼리 (hollow)
             self._draw_players(ax, sim_players, sim_ball,  sim_carrier, solid=True)   # 추천 장면 (solid)
+            subtitle = (
+                f"matches={int(r['match_count'])}" if "match_count" in r.index
+                else f"dist={r['distance']:.1f}"
+            )
             ax.set_title(
-                f"[Top-{rank}]  dist = {r['distance']:.1f}\n"
+                f"[Top-{rank}]  {subtitle}\n"
                 f"{r['type_name']} / {r['result_name']}\n"
                 f"VAEP = {r['vaep_value']:.4f}",
                 color="white", fontsize=10,
