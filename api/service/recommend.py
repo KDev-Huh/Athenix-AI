@@ -38,7 +38,7 @@ class RecommendService:
         )
         self._llm = LLMService()
 
-    def recommend_from_bytes(self, image_bytes: bytes, suffix: str) -> dict:
+    def recommend_from_bytes(self, image_bytes: bytes, suffix: str, is_rtl: bool = False) -> dict:
         """
         이미지 바이트를 받아 추천 결과 + LLM 설명을 반환한다.
 
@@ -67,7 +67,7 @@ class RecommendService:
             tmp_path = tmp.name
 
         try:
-            output = self._recommender.zone_recommend(image_path=tmp_path, show_plot=False)
+            output = self._recommender.zone_recommend(image_path=tmp_path, show_plot=False, is_rtl=is_rtl)
         finally:
             os.unlink(tmp_path)
 
